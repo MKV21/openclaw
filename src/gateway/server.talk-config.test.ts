@@ -285,7 +285,7 @@ describe("gateway talk.config", () => {
           modelId: "tts-1",
           speed: 1.25,
         });
-        expect(res.ok).toBe(true);
+        expect(res.ok, JSON.stringify(res)).toBe(true);
         expect(res.payload?.provider).toBe("openai");
         expect(res.payload?.outputFormat).toBe("mp3");
         expect(res.payload?.mimeType).toBe("audio/mpeg");
@@ -338,7 +338,7 @@ describe("gateway talk.config", () => {
           voiceId: "clawd",
           outputFormat: "pcm_44100",
         });
-        expect(res.ok).toBe(true);
+        expect(res.ok, JSON.stringify(res)).toBe(true);
         expect(res.payload?.provider).toBe("elevenlabs");
         expect(res.payload?.outputFormat).toBe("pcm_44100");
         expect(res.payload?.audioBase64).toBe(Buffer.from([4, 5, 6]).toString("base64"));
@@ -366,7 +366,7 @@ describe("gateway talk.config", () => {
     });
 
     const previousRegistry = getActivePluginRegistry() ?? createEmptyPluginRegistry();
-    setActivePluginRegistry({
+    const acmeRegistry = {
       ...createEmptyPluginRegistry(),
       speechProviders: [
         {
@@ -385,15 +385,16 @@ describe("gateway talk.config", () => {
           },
         },
       ],
-    });
+    };
 
     try {
       await withServer(async (ws) => {
+        setActivePluginRegistry(acmeRegistry);
         await connectOperator(ws, ["operator.read", "operator.write"]);
         const res = await fetchTalkSpeak(ws, {
           text: "Hello from plugin talk mode.",
         });
-        expect(res.ok).toBe(true);
+        expect(res.ok, JSON.stringify(res)).toBe(true);
         expect(res.payload?.provider).toBe("acme");
         expect(res.payload?.audioBase64).toBe(Buffer.from([7, 8, 9]).toString("base64"));
       });

@@ -24,6 +24,23 @@ val wantsAndroidReleaseBuild =
             Regex("""(^|:)(bundle|assemble)$""").containsMatchIn(taskName)
     }
 
+val supportedAndroidTalkPlaybackModes = setOf("system", "auto")
+val androidTalkPlaybackMode =
+    providers
+        .gradleProperty("OPENCLAW_ANDROID_TALK_PLAYBACK_MODE")
+        .orNull
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf { it.isNotEmpty() }
+        ?: "system"
+
+if (androidTalkPlaybackMode !in supportedAndroidTalkPlaybackModes) {
+    error(
+        "Invalid OPENCLAW_ANDROID_TALK_PLAYBACK_MODE '$androidTalkPlaybackMode'. " +
+            "Expected one of: ${supportedAndroidTalkPlaybackModes.joinToString(", ")}.",
+    )
+}
+
 if (wantsAndroidReleaseBuild && !hasAndroidReleaseSigning) {
     error(
         "Missing Android release signing properties. Set OPENCLAW_ANDROID_STORE_FILE, " +
@@ -67,6 +84,7 @@ android {
         targetSdk = 36
         versionCode = 2026040301
         versionName = "2026.4.3"
+        buildConfigField("String", "OPENCLAW_TALK_PLAYBACK_MODE", "\"$androidTalkPlaybackMode\"")
         ndk {
             // Support all major ABIs — native libs are tiny (~47 KB per ABI)
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")

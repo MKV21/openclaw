@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -15,10 +16,13 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import android.util.Base64
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.content.ContextCompat
+import ai.openclaw.app.BuildConfig
 import ai.openclaw.app.gateway.GatewaySession
+import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -57,10 +61,12 @@ class TalkModeManager(
     private const val chatFinalWaitWithSubscribeMs = 45_000L
     private const val chatFinalWaitWithoutSubscribeMs = 6_000L
     private const val maxCachedRunCompletions = 128
+    private const val talkSpeakTimeoutMs = 30_000L
   }
 
   private val mainHandler = Handler(Looper.getMainLooper())
   private val json = Json { ignoreUnknownKeys = true }
+  private val talkPlaybackMode = TalkPlaybackMode.fromConfigValue(BuildConfig.OPENCLAW_TALK_PLAYBACK_MODE)
 
   private val _isEnabled = MutableStateFlow(false)
   val isEnabled: StateFlow<Boolean> = _isEnabled
@@ -88,6 +94,8 @@ class TalkModeManager(
   private var lastHeardAtMs: Long? = null
   private var lastSpokenText: String? = null
   private var lastInterruptedAtSeconds: Double? = null
+  private var currentVoiceId: String? = null
+  private var currentModelId: String? = null
 
   // Interrupt-on-speech is disabled by default: starting a SpeechRecognizer during
   // TTS creates an audio session conflict on some OEMs. Can be enabled via gateway talk config.
@@ -110,6 +118,8 @@ class TalkModeManager(
   private var textToSpeech: TextToSpeech? = null
   private var textToSpeechInit: CompletableDeferred<TextToSpeech>? = null
   @Volatile private var currentUtteranceId: String? = null
+  @Volatile private var player: MediaPlayer? = null
+  @Volatile private var gatewayPlaybackFinished: CompletableDeferred<Unit>? = null
   @Volatile private var finalizeInFlight = false
   private var listenWatchdogJob: Job? = null
 
@@ -521,10 +531,19 @@ class TalkModeManager(
   }
 
   private fun buildPrompt(transcript: String): String {
-    val lines = mutableListOf(
-      "Talk Mode active. Reply in a concise, spoken tone.",
-      "You may optionally prefix the response with JSON (first line) to set ElevenLabs voice (id or alias), e.g. {\"voice\":\"<id>\",\"once\":true}.",
-    )
+    val lines = mutableListOf("Talk Mode active. Reply in a concise, spoken tone.")
+    when (talkPlaybackMode) {
+      TalkPlaybackMode.Auto -> {
+        lines.add(
+          "You may optionally prefix the response with JSON (first line) to set speech voice, model, language, or speed, e.g. {\"voice\":\"<id>\",\"once\":true}.",
+        )
+      }
+      TalkPlaybackMode.System -> {
+        lines.add(
+          "You may optionally prefix the response with JSON (first line) to set speech language or speed, e.g. {\"language\":\"en\",\"speed\":1.1}.",
+        )
+      }
+    }
     lastInterruptedAtSeconds?.let {
       lines.add("Assistant speech interrupted at ${"%.1f".format(it)}s.")
       lastInterruptedAtSeconds = null
@@ -661,16 +680,23 @@ class TalkModeManager(
     requestAudioFocusForTts()
 
     try {
-      val ttsStarted = SystemClock.elapsedRealtime()
-      speakWithSystemTts(cleaned, directive, playbackToken)
-      Log.d(tag, "system tts ok durMs=${SystemClock.elapsedRealtime() - ttsStarted}")
+      when (talkPlaybackMode) {
+        TalkPlaybackMode.System -> {
+          val ttsStarted = SystemClock.elapsedRealtime()
+          speakWithSystemTts(cleaned, directive, playbackToken)
+          Log.d(tag, "system tts ok durMs=${SystemClock.elapsedRealtime() - ttsStarted}")
+        }
+        TalkPlaybackMode.Auto -> {
+          speakWithAutoMode(cleaned, directive, playbackToken)
+        }
+      }
     } catch (err: Throwable) {
       if (isPlaybackCancelled(err, playbackToken)) {
         Log.d(tag, "assistant speech cancelled")
         return
       }
       _statusText.value = "Speak failed: ${err.message ?: err::class.simpleName}"
-      Log.w(tag, "system tts failed: ${err.message ?: err::class.simpleName}")
+      Log.w(tag, "assistant speech failed: ${err.message ?: err::class.simpleName}")
     }
   }
 
@@ -697,7 +723,7 @@ class TalkModeManager(
         return
       }
       previousJob?.takeIf { it !== currentJob }?.cancel()
-      stopTextToSpeechPlayback()
+      stopActiveSpeechPlayback()
       shouldResumeAfterSpeak = true
       onBeforeSpeak()
       ensurePlaybackActive(playbackToken)
@@ -725,7 +751,7 @@ class TalkModeManager(
         ttsJob
       }
     activeJob?.cancel()
-    stopTextToSpeechPlayback()
+    stopActiveSpeechPlayback()
   }
 
   private suspend fun speakWithSystemTts(text: String, directive: TalkDirective?, playbackToken: Long) {
@@ -750,7 +776,9 @@ class TalkModeManager(
           throw IllegalStateException("Language unavailable on this device")
         }
       }
-      engine.setSpeechRate((TalkModeRuntime.resolveSpeed(directive?.speed, directive?.rateWpm) ?: 1.0).toFloat())
+      engine.setSpeechRate(
+        (TalkPlaybackValueValidator.resolveSpeed(directive?.speed, directive?.rateWpm) ?: 1.0).toFloat(),
+      )
       engine.setAudioAttributes(
         AudioAttributes.Builder()
           .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -805,6 +833,131 @@ class TalkModeManager(
     }
   }
 
+  private suspend fun speakWithAutoMode(text: String, directive: TalkDirective?, playbackToken: Long) {
+    val plan = TalkSpeakRequestPlanner.build(text, directive, currentVoiceId, currentModelId)
+    currentVoiceId = plan.nextVoiceId
+    currentModelId = plan.nextModelId
+
+    try {
+      val ttsStarted = SystemClock.elapsedRealtime()
+      val speech = requestTalkSpeak(plan.params)
+      playGatewaySpeech(speech, playbackToken)
+      Log.d(tag, "talk.speak ok durMs=${SystemClock.elapsedRealtime() - ttsStarted} provider=${speech.provider}")
+    } catch (err: Throwable) {
+      if (isPlaybackCancelled(err, playbackToken)) {
+        throw err
+      }
+      Log.w(tag, "talk.speak failed; falling back to system tts: ${err.message ?: err::class.simpleName}")
+      val fallbackStarted = SystemClock.elapsedRealtime()
+      speakWithSystemTts(text, directive, playbackToken)
+      Log.d(tag, "system tts fallback ok durMs=${SystemClock.elapsedRealtime() - fallbackStarted}")
+    }
+  }
+
+  private data class GatewayTalkSpeech(
+    val audioBase64: String,
+    val provider: String,
+    val outputFormat: String?,
+    val mimeType: String?,
+    val fileExtension: String?,
+  )
+
+  private suspend fun requestTalkSpeak(params: JsonObject): GatewayTalkSpeech {
+    val res = session.request("talk.speak", params.toString(), timeoutMs = talkSpeakTimeoutMs)
+    val root = json.parseToJsonElement(res).asObjectOrNull() ?: error("talk.speak returned invalid JSON")
+    val audioBase64 = root["audioBase64"].asStringOrNull()?.trim().orEmpty()
+    val provider = root["provider"].asStringOrNull()?.trim().orEmpty()
+    if (audioBase64.isEmpty()) {
+      error("talk.speak missing audioBase64")
+    }
+    if (provider.isEmpty()) {
+      error("talk.speak missing provider")
+    }
+    return GatewayTalkSpeech(
+      audioBase64 = audioBase64,
+      provider = provider,
+      outputFormat = root["outputFormat"].asStringOrNull()?.trim(),
+      mimeType = root["mimeType"].asStringOrNull()?.trim(),
+      fileExtension = root["fileExtension"].asStringOrNull()?.trim(),
+    )
+  }
+
+  private suspend fun playGatewaySpeech(speech: GatewayTalkSpeech, playbackToken: Long) {
+    ensurePlaybackActive(playbackToken)
+    stopActiveSpeechPlayback()
+    ensurePlaybackActive(playbackToken)
+
+    val audioBytes =
+      try {
+        Base64.decode(speech.audioBase64, Base64.DEFAULT)
+      } catch (err: IllegalArgumentException) {
+        throw IllegalStateException("talk.speak returned invalid audio", err)
+      }
+    val suffix = resolveGatewayAudioSuffix(speech)
+    val tempFile =
+      withContext(Dispatchers.IO) {
+        File.createTempFile("tts_", suffix, context.cacheDir).apply {
+          writeBytes(audioBytes)
+        }
+      }
+    try {
+      val player = MediaPlayer()
+      val finished = CompletableDeferred<Unit>()
+      this.player = player
+      gatewayPlaybackFinished = finished
+      player.setAudioAttributes(
+        AudioAttributes.Builder()
+          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+          .setUsage(AudioAttributes.USAGE_MEDIA)
+          .build(),
+      )
+      player.setOnCompletionListener { finished.complete(Unit) }
+      player.setOnErrorListener { _, what, extra ->
+        finished.completeExceptionally(IllegalStateException("MediaPlayer error what=$what extra=$extra"))
+        true
+      }
+      player.setDataSource(tempFile.absolutePath)
+      withContext(Dispatchers.IO) { player.prepare() }
+      ensurePlaybackActive(playbackToken)
+      player.start()
+      finished.await()
+      ensurePlaybackActive(playbackToken)
+    } finally {
+      cleanupPlayer()
+      tempFile.delete()
+    }
+  }
+
+  private fun resolveGatewayAudioSuffix(speech: GatewayTalkSpeech): String {
+    val extension = speech.fileExtension?.trim()
+    if (!extension.isNullOrEmpty()) {
+      return if (extension.startsWith(".")) extension else ".$extension"
+    }
+    val mimeType = speech.mimeType?.trim()?.lowercase()
+    if (mimeType == "audio/pcm" || mimeType == "audio/raw") {
+      error("talk.speak returned raw PCM audio; Android auto playback needs a container format")
+    }
+    if (mimeType == "audio/mpeg") return ".mp3"
+    if (mimeType == "audio/ogg") return ".ogg"
+    if (mimeType == "audio/wav") return ".wav"
+    if (mimeType == "audio/webm") {
+      Log.w(tag, "talk.speak returned webm audio; Android MediaPlayer support varies by device")
+      return ".webm"
+    }
+    val outputFormat = speech.outputFormat?.trim()?.lowercase().orEmpty()
+    if (outputFormat == "pcm" || outputFormat.startsWith("pcm_")) {
+      error("talk.speak returned raw PCM audio; Android auto playback needs a container format")
+    }
+    if (outputFormat == "mp3" || outputFormat.startsWith("mp3_") || outputFormat.endsWith("-mp3")) return ".mp3"
+    if (outputFormat == "opus" || outputFormat.startsWith("opus_")) return ".ogg"
+    if (outputFormat.endsWith("-wav")) return ".wav"
+    if (outputFormat.endsWith("-webm")) {
+      Log.w(tag, "talk.speak returned webm audio; Android MediaPlayer support varies by device")
+      return ".webm"
+    }
+    return ".mp3"
+  }
+
   fun stopTts() {
     stopSpeaking(resetInterrupt = true)
     _isSpeaking.value = false
@@ -813,14 +966,14 @@ class TalkModeManager(
 
   private fun stopSpeaking(resetInterrupt: Boolean = true) {
     if (!_isSpeaking.value) {
-      stopTextToSpeechPlayback()
+      stopActiveSpeechPlayback()
       abandonAudioFocus()
       return
     }
     if (resetInterrupt) {
       lastInterruptedAtSeconds = null
     }
-    stopTextToSpeechPlayback()
+    stopActiveSpeechPlayback()
     _isSpeaking.value = false
     abandonAudioFocus()
   }
@@ -926,6 +1079,32 @@ class TalkModeManager(
     }
   }
 
+  private fun stopActiveSpeechPlayback() {
+    stopTextToSpeechPlayback()
+    cleanupPlayer()
+  }
+
+  private fun cleanupPlayer() {
+    val activePlayer = player
+    player = null
+    val finished = gatewayPlaybackFinished
+    gatewayPlaybackFinished = null
+    if (finished != null && !finished.isCompleted) {
+      finished.completeExceptionally(CancellationException("assistant speech cancelled"))
+    }
+    if (activePlayer == null) return
+    try {
+      activePlayer.stop()
+    } catch (_: Throwable) {
+      // Ignore best-effort shutdown errors when interrupting or cleaning up playback.
+    }
+    try {
+      activePlayer.release()
+    } catch (_: Throwable) {
+      // Ignore best-effort release errors during teardown.
+    }
+  }
+
   private fun shutdownTextToSpeech() {
     synchronized(ttsLock) {
       currentUtteranceId = null
@@ -981,24 +1160,8 @@ class TalkModeManager(
   }
 
   private object TalkModeRuntime {
-    fun resolveSpeed(speed: Double?, rateWpm: Int?): Double? {
-      if (rateWpm != null && rateWpm > 0) {
-        val resolved = rateWpm.toDouble() / 175.0
-        if (resolved <= 0.5 || resolved >= 2.0) return null
-        return resolved
-      }
-      if (speed != null) {
-        if (speed <= 0.5 || speed >= 2.0) return null
-        return speed
-      }
-      return null
-    }
-
     fun validatedLanguage(value: String?): String? {
-      val normalized = value?.trim()?.lowercase() ?: return null
-      if (normalized.length != 2) return null
-      if (!normalized.all { it in 'a'..'z' }) return null
-      return normalized
+      return TalkPlaybackValueValidator.validatedLanguage(value)
     }
 
     fun isMessageTimestampAfter(timestamp: Double, sinceSeconds: Double): Boolean {
